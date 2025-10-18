@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Union # Added from your version
 
 import numpy as np
 import torch
 
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.engine.validator import BaseValidator
-from ultralytics.utils import LOGGER, nms, ops
+from ultralytics.utils import LOGGER, nms, ops # Updated ops/nms import
 from ultralytics.utils.checks import check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
@@ -20,9 +20,6 @@ from ultralytics.utils.plotting import plot_images
 class DetectionValidator(BaseValidator):
     """
     A class extending the BaseValidator class for validation based on a detection model.
-
-    This class implements validation functionality specific to object detection tasks, including metrics calculation,
-    prediction processing, and visualization of results.
 
     Attributes:
         is_coco (bool): Whether the dataset is COCO.
@@ -71,6 +68,7 @@ class DetectionValidator(BaseValidator):
         Returns:
             (dict[str, Any]): Preprocessed batch.
         """
+        # New, more robust preprocessing loop
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
@@ -99,6 +97,7 @@ class DetectionValidator(BaseValidator):
         self.seen = 0
         self.jdict = []
         self.metrics.names = model.names
+        # New confusion matrix init
         self.confusion_matrix = ConfusionMatrix(names=model.names, save_matches=self.args.plots and self.args.visualize)
 
     def get_desc(self) -> str:
@@ -116,6 +115,7 @@ class DetectionValidator(BaseValidator):
             (list[dict[str, torch.Tensor]]): Processed predictions after NMS, where each dict contains
                 'bboxes', 'conf', 'cls', and 'extra' tensors.
         """
+        # Use new 'nms' import
         outputs = nms.non_max_suppression(
             preds,
             self.args.conf,
@@ -141,12 +141,12 @@ class DetectionValidator(BaseValidator):
             (dict[str, Any]): Prepared batch with processed annotations.
         """
         idx = batch["batch_idx"] == si
-        cls = batch["cls"][idx].squeeze(-1)
+        cls = batch["cls"][idx].squeeze(-1) # Use new version's squeeze
         bbox = batch["bboxes"][idx]
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
-        if cls.shape[0]:
+        if cls.shape[0]: # Use new version's check
             bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
         return {
             "cls": cls,
@@ -185,7 +185,7 @@ class DetectionValidator(BaseValidator):
             predn = self._prepare_pred(pred)
 
             cls = pbatch["cls"].cpu().numpy()
-            no_pred = predn["cls"].shape[0] == 0
+            no_pred = predn["cls"].shape[0] == 0 # Use new version's check
             self.metrics.update_stats(
                 {
                     **self._process_batch(predn, pbatch),
@@ -198,6 +198,7 @@ class DetectionValidator(BaseValidator):
             # Evaluate
             if self.args.plots:
                 self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
+                # Added new visualization hook
                 if self.args.visualize:
                     self.confusion_matrix.plot_matches(batch["img"][si], pbatch["im_file"], self.save_dir)
 
@@ -205,6 +206,7 @@ class DetectionValidator(BaseValidator):
                 continue
 
             # Save
+            # Added scale_preds call from new version
             if self.args.save_json or self.args.save_txt:
                 predn_scaled = self.scale_preds(predn, pbatch)
             if self.args.save_json:
@@ -266,8 +268,9 @@ class DetectionValidator(BaseValidator):
             batch (dict[str, Any]): Batch dictionary containing ground truth data with 'bboxes' and 'cls' keys.
 
         Returns:
-            (dict[str, np.ndarray]): Dictionary containing 'tp' key with correct prediction matrix of shape (N, 10) for 10 IoU levels.
+            (dict[str, np.ndarray]): Dictionary containing 'tp' key with correct prediction matrix of shape (N, 10)
         """
+        # Use new version's check
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
             return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
         iou = box_iou(batch["bboxes"], preds["bboxes"])
@@ -299,6 +302,7 @@ class DetectionValidator(BaseValidator):
             (torch.utils.data.DataLoader): Dataloader for validation.
         """
         dataset = self.build_dataset(dataset_path, batch=batch_size, mode="val")
+        # Use new version's dataloader build
         return build_dataloader(
             dataset, batch_size, self.args.workers, shuffle=False, rank=-1, drop_last=self.args.compile
         )
@@ -375,16 +379,8 @@ class DetectionValidator(BaseValidator):
             predn (dict[str, torch.Tensor]): Predictions dictionary containing 'bboxes', 'conf', and 'cls' keys
                 with bounding box coordinates, confidence scores, and class predictions.
             pbatch (dict[str, Any]): Batch dictionary containing 'imgsz', 'ori_shape', 'ratio_pad', and 'im_file'.
-
-        Examples:
-             >>> result = {
-             ...     "image_id": 42,
-             ...     "file_name": "42.jpg",
-             ...     "category_id": 18,
-             ...     "bbox": [258.15, 41.29, 348.26, 243.78],
-             ...     "score": 0.236,
-             ... }
         """
+        # Use new version's logic
         path = Path(pbatch["im_file"])
         stem = path.stem
         image_id = int(stem) if stem.isnumeric() else stem
@@ -394,13 +390,14 @@ class DetectionValidator(BaseValidator):
             self.jdict.append(
                 {
                     "image_id": image_id,
-                    "file_name": path.name,
+                    "file_name": path.name, # Added file_name from new version
                     "category_id": self.class_map[int(c)],
                     "bbox": [round(x, 3) for x in b],
                     "score": round(s, 5),
                 }
             )
-
+            
+    # New helper method from new version
     def scale_preds(self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Scales predictions to the original image size."""
         return {
