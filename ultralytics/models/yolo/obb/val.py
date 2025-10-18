@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import os # Added os
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple, Union # Added from your version
 
 import numpy as np
 import torch
 
+from ultralytics.data import build_dataloader, build_yolo_dataset, converter
+from ultralytics.engine.validator import BaseValidator
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.utils import LOGGER, ops
-from ultralytics.utils.metrics import OBBMetrics, batch_probiou
-from ultralytics.utils.nms import TorchNMS
+from ultralytics.utils.checks import check_requirements
+from ultralytics.utils.metrics import ConfusionMatrix, OBBMetrics, batch_probiou # Added ConfusionMatrix
+from ultralytics.utils.nms import TorchNMS # Added TorchNMS
+from ultralytics.utils.plotting import plot_images
 
 
 class OBBValidator(DetectionValidator):
@@ -86,12 +92,6 @@ class OBBValidator(DetectionValidator):
             (dict[str, np.ndarray]): Dictionary containing 'tp' key with the correct prediction matrix as a numpy
                 array with shape (N, 10), which includes 10 IoU levels for each detection, indicating the accuracy
                 of predictions compared to the ground truth.
-
-        Examples:
-            >>> detections = torch.rand(100, 7)  # 100 sample detections
-            >>> gt_bboxes = torch.rand(50, 5)  # 50 sample ground truth boxes
-            >>> gt_cls = torch.randint(0, 5, (50,))  # 50 ground truth class labels
-            >>> correct_matrix = validator._process_batch(detections, gt_bboxes, gt_cls)
         """
         if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
             return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
@@ -129,12 +129,12 @@ class OBBValidator(DetectionValidator):
             (dict[str, Any]): Prepared batch data with scaled bounding boxes and metadata.
         """
         idx = batch["batch_idx"] == si
-        cls = batch["cls"][idx].squeeze(-1)
+        cls = batch["cls"][idx].squeeze(-1) # Use squeeze from new version
         bbox = batch["bboxes"][idx]
         ori_shape = batch["ori_shape"][si]
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
-        if cls.shape[0]:
+        if cls.shape[0]: # Use new version's check
             bbox[..., :4].mul_(torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]])  # target boxes
         return {
             "cls": cls,
@@ -145,6 +145,52 @@ class OBBValidator(DetectionValidator):
             "im_file": batch["im_file"][si],
         }
 
+    def update_metrics(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
+        """
+        Update metrics with new predictions and ground truth.
+
+        Args:
+            preds (list[dict[str, torch.Tensor]]): List of predictions from the model.
+            batch (dict[str, Any]): Batch data containing ground truth.
+        """
+        for si, pred in enumerate(preds):
+            self.seen += 1
+            pbatch = self._prepare_batch(si, batch)
+            predn = self._prepare_pred(pred)
+
+            cls = pbatch["cls"].cpu().numpy()
+            no_pred = predn["cls"].shape[0] == 0
+            self.metrics.update_stats(
+                {
+                    **self._process_batch(predn, pbatch),
+                    "target_cls": cls,
+                    "target_img": np.unique(cls),
+                    "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
+                    "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                }
+            )
+            # Evaluate
+            if self.args.plots:
+                self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
+                if self.args.visualize: # Added from new version
+                    self.confusion_matrix.plot_matches(batch["img"][si], pbatch["im_file"], self.save_dir)
+
+            if no_pred:
+                continue
+
+            # Save
+            if self.args.save_json or self.args.save_txt: # Logic from new version
+                predn_scaled = self.scale_preds(predn, pbatch)
+            if self.args.save_json:
+                self.pred_to_json(predn_scaled, pbatch)
+            if self.args.save_txt:
+                self.save_one_txt(
+                    predn_scaled,
+                    self.args.save_conf,
+                    pbatch["ori_shape"],
+                    self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
+                )
+
     def plot_predictions(self, batch: dict[str, Any], preds: list[torch.Tensor], ni: int) -> None:
         """
         Plot predicted bounding boxes on input images and save the result.
@@ -153,12 +199,6 @@ class OBBValidator(DetectionValidator):
             batch (dict[str, Any]): Batch data containing images, file paths, and other metadata.
             preds (list[torch.Tensor]): List of prediction tensors for each image in the batch.
             ni (int): Batch index used for naming the output file.
-
-        Examples:
-            >>> validator = OBBValidator()
-            >>> batch = {"img": images, "im_file": paths}
-            >>> preds = [torch.rand(10, 7)]  # Example predictions for one image
-            >>> validator.plot_predictions(batch, preds, 0)
         """
         for p in preds:
             # TODO: fix this duplicated `xywh2xyxy`
@@ -173,22 +213,17 @@ class OBBValidator(DetectionValidator):
             predn (dict[str, torch.Tensor]): Prediction dictionary containing 'bboxes', 'conf', and 'cls' keys
                 with bounding box coordinates, confidence scores, and class predictions.
             pbatch (dict[str, Any]): Batch dictionary containing 'imgsz', 'ori_shape', 'ratio_pad', and 'im_file'.
-
-        Notes:
-            This method processes rotated bounding box predictions and converts them to both rbox format
-            (x, y, w, h, angle) and polygon format (x1, y1, x2, y2, x3, y3, x4, y4) before adding them
-            to the JSON dictionary.
         """
-        path = Path(pbatch["im_file"])
+        path = Path(pbatch["im_file"]) # From new version
         stem = path.stem
         image_id = int(stem) if stem.isnumeric() else stem
-        rbox = predn["bboxes"]
+        rbox = predn["bboxes"] # Assumes predn is already scaled
         poly = ops.xywhr2xyxyxyxy(rbox).view(-1, 8)
         for r, b, s, c in zip(rbox.tolist(), poly.tolist(), predn["conf"].tolist(), predn["cls"].tolist()):
             self.jdict.append(
                 {
                     "image_id": image_id,
-                    "file_name": path.name,
+                    "file_name": path.name, # Added from new version
                     "category_id": self.class_map[int(c)],
                     "score": round(s, 5),
                     "rbox": [round(x, 3) for x in r],
@@ -206,11 +241,6 @@ class OBBValidator(DetectionValidator):
             save_conf (bool): Whether to save confidence scores in the text file.
             shape (tuple[int, int]): Original image shape in format (height, width).
             file (Path): Output file path to save detections.
-
-        Examples:
-            >>> validator = OBBValidator()
-            >>> predn = torch.tensor([[100, 100, 50, 30, 0.9, 0, 45]])  # One detection: x,y,w,h,conf,cls,angle
-            >>> validator.save_one_txt(predn, True, (640, 480), "detection.txt")
         """
         import numpy as np
 
@@ -223,6 +253,7 @@ class OBBValidator(DetectionValidator):
             obb=torch.cat([predn["bboxes"], predn["conf"].unsqueeze(-1), predn["cls"].unsqueeze(-1)], dim=1),
         ).save_txt(file, save_conf=save_conf)
 
+    # Added new helper method
     def scale_preds(self, predn: dict[str, torch.Tensor], pbatch: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Scales predictions to the original image size."""
         return {
@@ -261,8 +292,7 @@ class OBBValidator(DetectionValidator):
 
                 with open(f"{pred_txt / f'Task1_{classname}'}.txt", "a", encoding="utf-8") as f:
                     f.writelines(f"{image_id} {score} {p[0]} {p[1]} {p[2]} {p[3]} {p[4]} {p[5]} {p[6]} {p[7]}\n")
-            # Save merged results, this could result slightly lower map than using official merging script,
-            # because of the probiou calculation.
+            # Save merged results
             pred_merged_txt = self.save_dir / "predictions_merged_txt"  # predictions
             pred_merged_txt.mkdir(parents=True, exist_ok=True)
             merged_results = defaultdict(list)
@@ -270,7 +300,9 @@ class OBBValidator(DetectionValidator):
             for d in data:
                 image_id = d["image_id"].split("__", 1)[0]
                 pattern = re.compile(r"\d+___\d+")
-                x, y = (int(c) for c in re.findall(pattern, d["image_id"])[0].split("___"))
+                # Handle cases where pattern might not be found (e.g., non-split images)
+                match = re.findall(pattern, d["image_id"])
+                x, y = (int(c) for c in match[0].split("___")) if match else (0, 0)
                 bbox, score, cls = d["rbox"], d["score"], d["category_id"] - 1
                 bbox[0] += x
                 bbox[1] += y
@@ -283,7 +315,7 @@ class OBBValidator(DetectionValidator):
                 scores = bbox[:, 5]  # scores
                 b = bbox[:, :5].clone()
                 b[:, :2] += c
-                # 0.3 could get results close to the ones from official merging script, even slightly better.
+                # Use new TorchNMS method
                 i = TorchNMS.fast_nms(b, scores, 0.3, iou_func=batch_probiou)
                 bbox = bbox[i]
 
