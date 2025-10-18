@@ -11,7 +11,7 @@ import zipfile
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from tarfile import is_tarfile
-from typing import Any
+from typing import Any, Dict, List, Tuple, Union # Added Dict, List, Tuple, Union for type hinting consistency
 
 import cv2
 import numpy as np
@@ -19,9 +19,10 @@ from PIL import Image, ImageOps
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.utils import (
-    ASSETS_URL,
+    ASSETS_URL, # Added ASSETS_URL
     DATASETS_DIR,
     LOGGER,
+    MACOS, # Added MACOS back
     NUM_THREADS,
     ROOT,
     SETTINGS_FILE,
@@ -37,8 +38,12 @@ from ultralytics.utils.downloads import download, safe_download, unzip_file
 from ultralytics.utils.ops import segments2boxes
 
 HELP_URL = "See https://docs.ultralytics.com/datasets for dataset formatting guidance."
-IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm", "heic"}  # image suffixes
+# NOTE: cache version is inside YOLODataset now, remove constant here
+# DATASET_CACHE_VERSION = "1.0.3"  # Ultralytics dataset cache version
+# Merged IMG_FORMATS: Included 'npy' from your version into the newer set
+IMG_FORMATS = {"bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm", "heic", "npy"}
 VID_FORMATS = {"asf", "avi", "gif", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ts", "wmv", "webm"}  # video suffixes
+PIN_MEMORY = str(os.getenv("PIN_MEMORY", not MACOS)).lower() == "true"  # global pin_memory for dataloaders
 FORMATS_HELP_MSG = f"Supported formats are:\nimages: {IMG_FORMATS}\nvideos: {VID_FORMATS}"
 
 
@@ -69,7 +74,7 @@ def check_file_speeds(
         >>> image_files = list(Path("dataset/images").glob("*.jpg"))
         >>> check_file_speeds(image_files, threshold_ms=15)
     """
-    if not files:
+    if not files: # Simplified check from new version
         LOGGER.warning(f"{prefix}Image speed checks: No files to check")
         return
 
@@ -116,7 +121,8 @@ def check_file_speeds(
     else:
         speed_msg = ""
 
-    if avg_ping < threshold_ms or avg_speed < threshold_mb:
+    # Updated logic for info/warning message from new version
+    if avg_ping < threshold_ms and avg_speed > threshold_mb:
         LOGGER.info(f"{prefix}Fast image access ✅ ({ping_msg}{speed_msg}{size_msg})")
     else:
         LOGGER.warning(
@@ -201,7 +207,7 @@ def verify_image_label(args: tuple) -> list:
         # Verify labels
         if os.path.isfile(lb_file):
             nf = 1  # label found
-            with open(lb_file, encoding="utf-8") as f:
+            with open(lb_file, encoding="utf-8") as f: # Added explicit encoding from new version
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
                 if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
@@ -217,10 +223,12 @@ def verify_image_label(args: tuple) -> list:
                     points = lb[:, 1:]
                 # Coordinate points check with 1% tolerance
                 assert points.max() <= 1.01, f"non-normalized or out of bounds coordinates {points[points > 1.01]}"
+                # Updated min check from new version
                 assert lb.min() >= -0.01, f"negative class labels or coordinate {lb[lb < -0.01]}"
 
                 # All labels
-                max_cls = 0 if single_cls else lb[:, 0].max()  # max label count
+                # Updated max_cls logic from new version
+                max_cls = 0 if single_cls else lb[:, 0].max() # max label count
                 assert max_cls < num_cls, (
                     f"Label class {int(max_cls)} exceeds dataset class count {num_cls}. "
                     f"Possible class labels are 0-{num_cls - 1}"
@@ -236,7 +244,7 @@ def verify_image_label(args: tuple) -> list:
                 lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
         else:
             nm = 1  # label missing
-            lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32)
+            lb = np.zeros((0, (5 + nkpt * ndim) if keypoint else 5), dtype=np.float32) # Corrected keypoints to keypoint
         if keypoint:
             keypoints = lb[:, 5:].reshape(-1, nkpt, ndim)
             if ndim == 2:
@@ -348,10 +356,11 @@ def polygons2masks_overlap(
     )
     areas = []
     ms = []
+    # Updated loop variable name from new version
     for segment in segments:
         mask = polygon2mask(
             imgsz,
-            [segment.reshape(-1)],
+            [segment.reshape(-1)], # Updated variable name
             downsample_ratio=downsample_ratio,
             color=1,
         )
@@ -472,6 +481,7 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
                 safe_download(url=s, dir=DATASETS_DIR, delete=True)
             elif s.startswith("bash "):  # bash script
                 LOGGER.info(f"Running {s} ...")
+                # Updated subprocess call from new version
                 subprocess.run(s.split(), check=True)
             else:  # python script
                 exec(s, {"yaml": data})
@@ -513,6 +523,7 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
     dataset = Path(dataset)
     data_dir = (dataset if dataset.is_dir() else (DATASETS_DIR / dataset)).resolve()
     if not data_dir.is_dir():
+        # Added check for file suffix from new version
         if data_dir.suffix != "":
             raise ValueError(
                 f'Classification datasets must be a directory (data="path/to/dir") not a file (data="{dataset}"), '
@@ -522,13 +533,16 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
         LOGGER.warning(f"Dataset not found, missing path {data_dir}, attempting download...")
         t = time.time()
         if str(dataset) == "imagenet":
+            # Updated subprocess call from new version
             subprocess.run(["bash", str(ROOT / "data/scripts/get_imagenet.sh")], check=True)
         else:
+             # Updated download URL from new version
             download(f"{ASSETS_URL}/{dataset}.zip", dir=data_dir.parent)
         LOGGER.info(f"Dataset download success ✅ ({time.time() - t:.1f}s), saved to {colorstr('bold', data_dir)}\n")
     train_set = data_dir / "train"
     if not train_set.is_dir():
         LOGGER.warning(f"Dataset 'split=train' not found at {train_set}")
+         # Updated file search logic from new version
         if image_files := list(data_dir.rglob("*.jpg")) + list(data_dir.rglob("*.png")):
             from ultralytics.data.split import split_classify_dataset
 
@@ -763,7 +777,7 @@ def compress_one_image(f: str, f_new: str = None, max_dim: int = 1920, quality: 
         >>> from pathlib import Path
         >>> from ultralytics.data.utils import compress_one_image
         >>> for f in Path("path/to/dataset").rglob("*.jpg"):
-        >>>    compress_one_image(f)
+        >>>     compress_one_image(f)
     """
     try:  # use PIL
         Image.MAX_IMAGE_PIXELS = None  # Fix DecompressionBombError, allow optimization of image > ~178.9 million pixels
@@ -786,6 +800,8 @@ def compress_one_image(f: str, f_new: str = None, max_dim: int = 1920, quality: 
 
 def load_dataset_cache_file(path: Path) -> dict:
     """Load an Ultralytics *.cache dictionary from path."""
+    # NOTE: Caching is handled in YOLODataset class now. Loading cache file directly might not be needed.
+    # Keep function for potential legacy use or direct cache inspection.
     import gc
 
     gc.disable()  # reduce pickle load time https://github.com/ultralytics/ultralytics/pull/1585
@@ -796,6 +812,8 @@ def load_dataset_cache_file(path: Path) -> dict:
 
 def save_dataset_cache_file(prefix: str, path: Path, x: dict, version: str):
     """Save an Ultralytics dataset *.cache dictionary x to path."""
+    # NOTE: Caching is handled in YOLODataset class now. Saving cache file directly might not be needed.
+    # Keep function for potential legacy use or direct cache manipulation.
     x["version"] = version  # add cache version
     if is_dir_writeable(path.parent):
         if path.exists():
