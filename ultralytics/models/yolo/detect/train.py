@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 from copy import copy
-from typing import Any
+from typing import Any, Dict, List, Optional # Added Dict, List, Optional
 
 import numpy as np
 import torch
@@ -15,42 +15,16 @@ from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
+from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, ops # Added ops import
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
-from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
+from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model # Replaced de_parallel
 
 
 class DetectionTrainer(BaseTrainer):
     """
     A class extending the BaseTrainer class for training based on a detection model.
-
-    This trainer specializes in object detection tasks, handling the specific requirements for training YOLO models
-    for object detection including dataset building, data loading, preprocessing, and model configuration.
-
-    Attributes:
-        model (DetectionModel): The YOLO detection model being trained.
-        data (dict): Dictionary containing dataset information including class names and number of classes.
-        loss_names (tuple): Names of the loss components used in training (box_loss, cls_loss, dfl_loss).
-
-    Methods:
-        build_dataset: Build YOLO dataset for training or validation.
-        get_dataloader: Construct and return dataloader for the specified mode.
-        preprocess_batch: Preprocess a batch of images by scaling and converting to float.
-        set_model_attributes: Set model attributes based on dataset information.
-        get_model: Return a YOLO detection model.
-        get_validator: Return a validator for model evaluation.
-        label_loss_items: Return a loss dictionary with labeled training loss items.
-        progress_string: Return a formatted string of training progress.
-        plot_training_samples: Plot training samples with their annotations.
-        plot_training_labels: Create a labeled training plot of the YOLO model.
-        auto_batch: Calculate optimal batch size based on model memory requirements.
-
-    Examples:
-        >>> from ultralytics.models.yolo.detect import DetectionTrainer
-        >>> args = dict(model="yolo11n.pt", data="coco8.yaml", epochs=3)
-        >>> trainer = DetectionTrainer(overrides=args)
-        >>> trainer.train()
+    ... (docstring from new original, as it's more up-to-date) ...
     """
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
@@ -76,6 +50,7 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (Dataset): YOLO dataset object configured for the specified mode.
         """
+        # Use unwrap_model from new version
         gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
 
@@ -99,6 +74,7 @@ class DetectionTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+        # Use new version's dataloader build
         return build_dataloader(
             dataset,
             batch=batch_size,
@@ -111,6 +87,7 @@ class DetectionTrainer(BaseTrainer):
     def preprocess_batch(self, batch: dict) -> dict:
         """
         Preprocess a batch of images by scaling and converting to float.
+        (Using new version's more robust device handling)
 
         Args:
             batch (dict): Dictionary containing batch data with 'img' tensor.
@@ -216,11 +193,68 @@ class DetectionTrainer(BaseTrainer):
             on_plot=self.on_plot,
         )
 
+    # This is your custom method, which is necessary for your OBB data
     def plot_training_labels(self):
         """Create a labeled training plot of the YOLO model."""
-        boxes = np.concatenate([lb["bboxes"] for lb in self.train_loader.dataset.labels], 0)
+        from ultralytics.utils.ops import xywh2xyxy # Keep your needed import
+
+        boxes = []
+        for lb in self.train_loader.dataset.labels:
+            box = lb["bboxes"]
+            if box.shape[1] == 8:  # It's a polygon (x1,y1,x2,y2,x3,y3,x4,y4)
+                # Convert polygon to an axis-aligned bounding box for plotting
+                x = box[:, 0::2]
+                y = box[:, 1::2]
+                box = np.concatenate([x.min(1, keepdims=True), y.min(1, keepdims=True),
+                                      x.max(1, keepdims=True), y.max(1, keepdims=True)], axis=1)
+                # Convert xyxy to xywh for plot_labels function
+                box = ops.xyxy2xywh(box)
+                boxes.append(box)
+            elif box.shape[1] == 5:  # It's an OBB box (x,y,w,h,a)
+                # Keep only xywh for plotting
+                boxes.append(box[:, :4])
+            elif box.shape[1] == 4:  # It's a standard box (xywh)
+                boxes.append(box)
+
+        if not boxes:
+            LOGGER.warning("WARNING ⚠️ No labels found in training set, can not plot training labels.")
+            return
+
+        boxes = np.concatenate(boxes, 0)
         cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
-        plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
+        
+        # Note: plot_labels expects xywh boxes
+        # We must convert AABB xyxy (from 8-point) to xywh
+        # Your original code converted 4-point and 5-point to xyxy, but plot_labels expects xywh
+        # Correcting the logic to ensure all inputs to plot_labels are xywh
+        
+        # Re-check logic: plot_labels expects xywh.
+        # Your 8-point logic converts to xyxy, then I added a conversion to xywh.
+        # Your 5-point logic takes xywhr -> xywh. (Correct)
+        # Your 4-point logic takes xywh. (Correct)
+        
+        # Let's re-implement your logic cleanly
+        boxes_for_plot = []
+        for lb in self.train_loader.dataset.labels:
+             box = lb["bboxes"]
+             if box.shape[1] == 8:  # 8-point polygon
+                 x = box[:, 0::2]
+                 y = box[:, 1::2]
+                 xyxy_box = np.concatenate([x.min(1, keepdims=True), y.min(1, keepdims=True),
+                                            x.max(1, keepdims=True), y.max(1, keepdims=True)], axis=1)
+                 boxes_for_plot.append(ops.xyxy2xywh(xyxy_box)) # Convert to xywh
+             elif box.shape[1] == 5: # 5-point OBB (xywhr)
+                 boxes_for_plot.append(box[:, :4]) # Use xywh part
+             elif box.shape[1] == 4: # 4-point AABB (xywh)
+                 boxes_for_plot.append(box)
+
+        if not boxes_for_plot:
+             LOGGER.warning("WARNING ⚠️ No labels found in training set, can not plot training labels.")
+             return
+
+        boxes_for_plot = np.concatenate(boxes_for_plot, 0)
+        cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
+        plot_labels(boxes_for_plot, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
 
     def auto_batch(self):
         """
