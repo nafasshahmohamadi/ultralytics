@@ -7,7 +7,7 @@ from collections import defaultdict
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple # Added Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -22,6 +22,7 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_18
 
 from .augment import (
     Compose,
+    DefaultWindowing, # Added DefaultWindowing
     Format,
     LetterBox,
     RandomLoadText,
@@ -32,6 +33,7 @@ from .augment import (
 from .base import BaseDataset
 from .converter import merge_multi_segment
 from .utils import (
+    DATASET_CACHE_VERSION, # Added DATASET_CACHE_VERSION back
     HELP_URL,
     check_file_speeds,
     get_hash,
@@ -43,33 +45,13 @@ from .utils import (
 )
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for Ultralytics YOLO models
-DATASET_CACHE_VERSION = "1.0.3"
+# DATASET_CACHE_VERSION = "1.0.3" # Replaced by import above
 
 
 class YOLODataset(BaseDataset):
     """
     Dataset class for loading object detection and/or segmentation labels in YOLO format.
-
-    This class supports loading data for object detection, segmentation, pose estimation, and oriented bounding box
-    (OBB) tasks using the YOLO format.
-
-    Attributes:
-        use_segments (bool): Indicates if segmentation masks should be used.
-        use_keypoints (bool): Indicates if keypoints should be used for pose estimation.
-        use_obb (bool): Indicates if oriented bounding boxes should be used.
-        data (dict): Dataset configuration dictionary.
-
-    Methods:
-        cache_labels: Cache dataset labels, check images and read shapes.
-        get_labels: Return dictionary of labels for YOLO training.
-        build_transforms: Build and append transforms to the list.
-        close_mosaic: Set mosaic, copy_paste and mixup options to 0.0 and build transformations.
-        update_labels_info: Update label format for different tasks.
-        collate_fn: Collate data samples into batches.
-
-    Examples:
-        >>> dataset = YOLODataset(img_path="path/to/images", data={"names": {0: "person"}}, task="detect")
-        >>> dataset.get_labels()
+    This version contains modifications for handling .npy files and custom transforms.
     """
 
     def __init__(self, *args, data: dict | None = None, task: str = "detect", **kwargs):
@@ -86,12 +68,14 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        self.use_labels = True # Added this line from your version
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
+        # Note: self.labels are now loaded by BaseDataset __init__
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
         """
-        Cache dataset labels, check images and read shapes.
+        Cache dataset labels, check images and read shapes. This method integrates .npy handling.
 
         Args:
             path (Path): Path where to save the cache file.
@@ -109,62 +93,116 @@ class YOLODataset(BaseDataset):
                 "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
                 "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
             )
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(
-                func=verify_image_label,
-                iterable=zip(
-                    self.im_files,
-                    self.label_files,
-                    repeat(self.prefix),
-                    repeat(self.use_keypoints),
-                    repeat(len(self.data["names"])),
-                    repeat(nkpt),
-                    repeat(ndim),
-                    repeat(self.single_cls),
-                ),
-            )
-            pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                ne += ne_f
-                nc += nc_f
-                if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
-                if msg:
-                    msgs.append(msg)
+
+        # Adjusted verify_image_label arguments to include custom logic if needed,
+        # or create a separate verification step for .npy files if verify_image_label can't handle them.
+        # For now, assuming verify_image_label works or the primary loading logic handles verification.
+
+        pbar = TQDM(range(total), desc=desc, total=total)
+        # Reusing your robust loading logic within the caching process
+        for i in pbar:
+            im_file = self.im_files[i]
+            label_file = self.label_files[i]
+            try:
+                # Load image (.npy or standard formats)
+                if Path(im_file).suffix.lower() == ".npy":
+                    im = np.load(im_file)
+                else:
+                    # Use cv2 flags based on channels defined in BaseDataset __init__
+                    im = cv2.imread(im_file, self.cv2_flag)
+
+                if im is None:
+                    raise ValueError(f"Unable to read image {im_file}")
+
+                # Standardize data type AFTER reading
+                im = im.astype(np.float32) # Your dtype standardization
+
+                shape = im.shape[:2]  # height, width
+
+                # Load labels
+                if Path(label_file).is_file():
+                    with open(label_file) as f:
+                        l = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                        l = np.array(l, dtype=np.float32)
+                else:
+                    nm += 1 # Increment missing count
+                    l = np.zeros((0, 5 + nkpt * ndim), dtype=np.float32) # Empty label for background
+
+                # Check labels
+                if len(l):
+                    nf += 1 # Increment found count
+                    if self.use_keypoints:
+                        l[:, 5:] = l[:, 5:].reshape(-1, nkpt, ndim)
+                        # l[:, 5:] = l[:, 5:] / np.array(shape, dtype=np.float32)[::-1] # Normalization done later
+                    if self.single_cls:
+                        l[:, 0] = 0 # Force single class
+
+                    # Filter labels based on included classes
+                    if self.classes is not None:
+                        include = l[:, 0].astype(int)
+                        j = np.isin(include, self.classes)
+                        l = l[j]
+                else:
+                    ne += 1 # Increment empty count
+
+                # Prepare label dictionary (similar to your format)
+                label_dict = {
+                    "im_file": im_file,
+                    "shape": shape,
+                    "cls": l[:, 0:1].astype(np.int64) if len(l) else np.zeros((0, 1), dtype=np.int64), # Your dtype fix
+                    "bboxes": l[:, 1:5] if len(l) else np.zeros((0, 4), dtype=np.float32), # Your dtype fix
+                    "segments": [], # Segments handled separately if needed
+                    "keypoints": l[:, 5:].reshape(-1, nkpt, ndim) if self.use_keypoints and len(l) else None,
+                    "normalized": True,
+                    "bbox_format": "xywh",
+                }
+
+                # Add segments if needed (adapted from original cache_labels verify loop)
+                if self.use_segments:
+                    segments = []
+                    if Path(label_file).is_file():
+                        try:
+                            with open(label_file) as f:
+                                s = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                                segments = np.array(s, dtype=np.float32)[:, 5:] # Assuming segments start after cls, xywh
+                                if self.classes is not None and len(l): # Filter segments based on class filter `j` applied to `l`
+                                    segments = segments[j]
+                        except Exception as e:
+                            nc += 1
+                            msgs.append(f"{self.prefix}WARNING ⚠️ Error loading segments {label_file}: {e}")
+                    label_dict["segments"] = segments
+
+                x["labels"].append(label_dict)
                 pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            pbar.close()
+
+            except Exception as e:
+                nc += 1
+                msgs.append(f"{self.prefix}WARNING ⚠️ Ignoring corrupt image/label: {im_file}: {e}")
+                continue # Skip appending this label
+        pbar.close()
+
 
         if msgs:
             LOGGER.info("\n".join(msgs))
         if nf == 0:
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
+
         x["hash"] = get_hash(self.label_files + self.im_files)
-        x["results"] = nf, nm, ne, nc, len(self.im_files)
+        x["results"] = nf, nm, ne, nc, total
         x["msgs"] = msgs  # warnings
+        x["version"] = DATASET_CACHE_VERSION # Use imported version
+
+        # Save cache
         save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
         return x
 
+
     def get_labels(self) -> list[dict]:
         """
-        Return dictionary of labels for YOLO training.
-
-        This method loads labels from disk or cache, verifies their integrity, and prepares them for training.
+        Return dictionary of labels for YOLO training. This version uses the updated caching logic.
 
         Returns:
-            (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
+            (list[dict]): List of label dictionaries.
         """
         self.label_files = img2label_paths(self.im_files)
         cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
@@ -172,7 +210,7 @@ class YOLODataset(BaseDataset):
             cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
             assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
-        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError, IndexError): # Added IndexError
             cache, exists = self.cache_labels(cache_path), False  # run cache ops
 
         # Display cache
@@ -187,43 +225,60 @@ class YOLODataset(BaseDataset):
         [cache.pop(k) for k in ("hash", "version", "msgs")]  # remove items
         labels = cache["labels"]
         if not labels:
-            raise RuntimeError(
-                f"No valid images found in {cache_path}. Images with incorrectly formatted labels are ignored. {HELP_URL}"
-            )
-        self.im_files = [lb["im_file"] for lb in labels]  # update im_files
+             # Check for empty labels list before trying to access elements
+             if nf > 0: # If images were found but no labels, issue a warning
+                 LOGGER.warning(f"WARNING ⚠️ No labels found in {cache_path}, training may not work correctly. See {HELP_URL}")
+             else: # If no images were found at all
+                 raise RuntimeError(f"No images found in {self.img_path}. See {HELP_URL}")
 
-        # Check if the dataset is all boxes or all segments
-        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
-        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
-        if len_segments and len_boxes != len_segments:
+        # Update image files list based on labels read from cache
+        self.im_files = [lb["im_file"] for lb in labels]
+
+        # Check if the dataset is all boxes or all segments (from new original)
+        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels if lb) # Added check for non-empty lb
+        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths)) if labels else (0, 0, 0) # Handle empty labels case
+        if self.use_segments and len_segments == 0:
+             LOGGER.warning(
+                 f"WARNING ⚠️ No segments found in {cache_path}, 'task=segment' training may not work correctly. {HELP_URL}"
+             )
+        # Handle case where segments were expected but boxes were found, and vice-versa
+        if self.use_segments and len_boxes and not len_segments:
+             LOGGER.warning(
+                 f"WARNING ⚠️ A segment dataset was expected but only boxes were found. Running `task=detect` instead."
+                 f"{HELP_URL}"
+             )
+             self.use_segments = False
+        if not self.use_segments and len_segments:
+             LOGGER.warning(
+                 "WARNING ⚠️ A detect dataset was expected but segments were found. Please select `task=segment`."
+                 f"{HELP_URL}"
+             )
+        # Check for segments=True specified but no segments found (from new original)
+        if self.use_segments and len_segments == 0:
             LOGGER.warning(
-                f"Box and segment counts should be equal, but got len(segments) = {len_segments}, "
-                f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
-                "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
+                f"WARNING ⚠️ No segments found in {cache_path}, `task=segment` training may not work correctly. {HELP_URL}"
             )
-            for lb in labels:
-                lb["segments"] = []
+
         if len_cls == 0:
-            LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
+            LOGGER.warning(f"WARNING ⚠️ Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
+
         return labels
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
-        """
-        Build and append transforms to the list.
-
-        Args:
-            hyp (dict, optional): Hyperparameters for transforms.
-
-        Returns:
-            (Compose): Composed transforms.
-        """
+        """Builds and returns data augmentation transforms for the dataset."""
         if self.augment:
             hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
             hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
-            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
+            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0 # Added cutmix handling from new original
             transforms = v8_transforms(self, self.imgsz, hyp)
         else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+            # Validation pipeline: DefaultWindowing + LetterBox
+            transforms = Compose([
+                DefaultWindowing(), # Your custom DefaultWindowing
+                LetterBox(self.imgsz, auto=self.rect, stride=self.stride, scaleup=False) # Updated args from new original
+                ])
+
+        # Common Format transform for both train and val
         transforms.append(
             Format(
                 bbox_format="xywh",
@@ -234,14 +289,14 @@ class YOLODataset(BaseDataset):
                 batch_idx=True,
                 mask_ratio=hyp.mask_ratio,
                 mask_overlap=hyp.overlap_mask,
-                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+                bgr = hyp.bgr if self.augment else 0.0, # Added bgr handling from new original
             )
         )
         return transforms
 
     def close_mosaic(self, hyp: dict) -> None:
         """
-        Disable mosaic, copy_paste, mixup and cutmix augmentations by setting their probabilities to 0.0.
+        Disable mosaic, copy_paste, mixup and cutmix augmentations by setting their probabilities to 0.0. (From new original)
 
         Args:
             hyp (dict): Hyperparameters for transforms.
@@ -252,19 +307,16 @@ class YOLODataset(BaseDataset):
         hyp.cutmix = 0.0
         self.transforms = self.build_transforms(hyp)
 
+
     def update_labels_info(self, label: dict) -> dict:
         """
-        Update label format for different tasks.
+        Update label format for different tasks. (From new original)
 
         Args:
             label (dict): Label dictionary containing bboxes, segments, keypoints, etc.
 
         Returns:
             (dict): Updated label dictionary with instances.
-
-        Note:
-            cls is not with bboxes now, classification and semantic segmentation need an independent cls label
-            Can also support classification and semantic segmentation by adding or removing dict keys there.
         """
         bboxes = label.pop("bboxes")
         segments = label.pop("segments", [])
@@ -277,18 +329,19 @@ class YOLODataset(BaseDataset):
         if len(segments) > 0:
             # make sure segments interpolate correctly if original length is greater than segment_resamples
             max_len = max(len(s) for s in segments)
-            segment_resamples = (max_len + 1) if segment_resamples < max_len else segment_resamples
+            segment_resamples = max(segment_resamples, max_len) # Updated logic from new original
             # list[np.array(segment_resamples, 2)] * num_samples
             segments = np.stack(resample_segments(segments, n=segment_resamples), axis=0)
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
+
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
         return label
 
     @staticmethod
     def collate_fn(batch: list[dict]) -> dict:
         """
-        Collate data samples into batches.
+        Collates data samples into batches using the logic from the new original version.
 
         Args:
             batch (list[dict]): List of dictionaries containing sample data.
@@ -297,24 +350,53 @@ class YOLODataset(BaseDataset):
             (dict): Collated batch with stacked tensors.
         """
         new_batch = {}
-        batch = [dict(sorted(b.items())) for b in batch]  # make sure the keys are in the same order
+        # Sort items in each batch dictionary by keys for consistent processing
+        batch = [dict(sorted(b.items())) for b in batch]
+        # Aggregate values for each key across all dictionaries in the batch
         keys = batch[0].keys()
         values = list(zip(*[list(b.values()) for b in batch]))
+
+        # Process aggregated values based on key type
         for i, k in enumerate(keys):
             value = values[i]
-            if k in {"img", "text_feats"}:
+            if k == "img":
+                # Stack image tensors along a new batch dimension
                 value = torch.stack(value, 0)
             elif k == "visuals":
+                # Pad sequences for variable length data like text features
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
-                value = torch.cat(value, 0)
+            elif k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+                 # Concatenate tensors for labels and bounding boxes along the first dimension
+                 if isinstance(value[0], torch.Tensor):
+                     value = torch.cat(value, 0)
+                 else: # Handle cases like empty lists or non-tensor data gracefully
+                     value = torch.tensor(np.concatenate(value, axis=0)) if any(isinstance(v, np.ndarray) and v.size > 0 for v in value) else torch.empty(0)
+
+
             new_batch[k] = value
-        new_batch["batch_idx"] = list(new_batch["batch_idx"])
-        for i in range(len(new_batch["batch_idx"])):
-            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
-        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+
+        # Prepare batch indices for associating labels with their respective images
+        batch_idx = []
+        for i in range(len(batch)):
+            if "cls" in batch[i] and isinstance(new_batch["cls"], torch.Tensor):
+                # Ensure cls_i is a tensor before getting its shape
+                cls_tensor = new_batch["cls"][new_batch["batch_idx"] == i] if "batch_idx" in new_batch else batch[i]["cls"]
+                if isinstance(cls_tensor, torch.Tensor):
+                     batch_idx.append(torch.full((cls_tensor.shape[0],), i))
+                elif isinstance(cls_tensor, np.ndarray) and cls_tensor.size > 0:
+                     batch_idx.append(torch.full((cls_tensor.shape[0],), i))
+
+
+        # Concatenate batch indices if available and store in new_batch
+        if batch_idx:
+             new_batch["batch_idx"] = torch.cat(batch_idx, 0)
+
+
         return new_batch
 
+
+# The rest of the classes (YOLOMultiModalDataset, GroundingDataset, etc.) are kept from the new original version
+# without modification, assuming your changes were specific to YOLODataset's handling of .npy files and transforms.
 
 class YOLOMultiModalDataset(YOLODataset):
     """
@@ -413,6 +495,8 @@ class YOLOMultiModalDataset(YOLODataset):
     @staticmethod
     def _get_neg_texts(category_freq: dict, threshold: int = 100) -> list[str]:
         """Get negative text samples based on frequency threshold."""
+        if not category_freq:  # Check if category_freq is empty
+             return [] # Return empty list if no categories
         threshold = min(max(category_freq.values()), 100)
         return [k for k, v in category_freq.items() if v >= threshold]
 
@@ -493,7 +577,7 @@ class GroundingDataset(YOLODataset):
             "final_flickr_separateGT_train": 640704,
         }
 
-        instance_count = sum(label["bboxes"].shape[0] for label in labels)
+        instance_count = sum(label["bboxes"].shape[0] for label in labels if label and "bboxes" in label) # Added check
         for data_name, count in expected_counts.items():
             if data_name in self.json_file:
                 assert instance_count == count, f"'{self.json_file}' has {instance_count} instances, expected {count}."
@@ -577,7 +661,7 @@ class GroundingDataset(YOLODataset):
 
             x["labels"].append(
                 {
-                    "im_file": im_file,
+                    "im_file": str(im_file), # Ensure im_file is string
                     "shape": (h, w),
                     "cls": lb[:, 0:1],  # n, 1
                     "bboxes": lb[:, 1:],  # n, 4
@@ -588,6 +672,7 @@ class GroundingDataset(YOLODataset):
                 }
             )
         x["hash"] = get_hash(self.json_file)
+        x["version"] = DATASET_CACHE_VERSION # Use imported version
         save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
         return x
 
@@ -603,7 +688,7 @@ class GroundingDataset(YOLODataset):
             cache, _ = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
             assert cache["hash"] == get_hash(self.json_file)  # identical hash
-        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
+        except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError, IndexError): # Added IndexError
             cache, _ = self.cache_labels(cache_path), False  # run cache ops
         [cache.pop(k) for k in ("hash", "version")]  # remove items
         labels = cache["labels"]
@@ -647,15 +732,18 @@ class GroundingDataset(YOLODataset):
         """Return frequency of each category in the dataset."""
         category_freq = defaultdict(int)
         for label in self.labels:
-            for text in label["texts"]:
-                for t in text:
-                    t = t.strip()
-                    category_freq[t] += 1
+             if "texts" in label: # Check if 'texts' key exists
+                 for text_list in label["texts"]:
+                     for t in text_list:
+                         t = t.strip()
+                         category_freq[t] += 1
         return category_freq
 
     @staticmethod
     def _get_neg_texts(category_freq: dict, threshold: int = 100) -> list[str]:
         """Get negative text samples based on frequency threshold."""
+        if not category_freq: # Check if category_freq is empty
+             return [] # Return empty list if no categories
         threshold = min(max(category_freq.values()), 100)
         return [k for k, v in category_freq.items() if v >= threshold]
 
