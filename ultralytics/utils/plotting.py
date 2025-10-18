@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import warnings
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Union # Import union for older python versions
 
 import cv2
 import numpy as np
@@ -38,7 +38,7 @@ class Colors:
 
     ## Ultralytics Color Palette
 
-    | Index | Color                                                             | HEX       | RGB               |
+    | Index | Color                                                               | HEX       | RGB               |
     |-------|-------------------------------------------------------------------|-----------|-------------------|
     | 0     | <i class="fa-solid fa-square fa-2xl" style="color: #042aff;"></i> | `#042aff` | (4, 42, 255)      |
     | 1     | <i class="fa-solid fa-square fa-2xl" style="color: #0bdbeb;"></i> | `#0bdbeb` | (11, 219, 235)    |
@@ -63,7 +63,7 @@ class Colors:
 
     ## Pose Color Palette
 
-    | Index | Color                                                             | HEX       | RGB               |
+    | Index | Color                                                               | HEX       | RGB               |
     |-------|-------------------------------------------------------------------|-----------|-------------------|
     | 0     | <i class="fa-solid fa-square fa-2xl" style="color: #ff8000;"></i> | `#ff8000` | (255, 128, 0)     |
     | 1     | <i class="fa-solid fa-square fa-2xl" style="color: #ff9933;"></i> | `#ff9933` | (255, 153, 51)    |
@@ -363,7 +363,7 @@ class Annotator:
                     lineType=cv2.LINE_AA,
                 )
 
-    def masks(self, masks, colors, im_gpu: torch.Tensor = None, alpha: float = 0.5, retina_masks: bool = False):
+    def masks(self, masks, colors, im_gpu: torch.Tensor | None = None, alpha: float = 0.5, retina_masks: bool = False):
         """
         Plot masks on image.
 
@@ -695,7 +695,8 @@ def plot_images(
     Plot image grid with labels, bounding boxes, masks, and keypoints.
 
     Args:
-        labels (dict[str, Any]): Dictionary containing detection data with keys like 'cls', 'bboxes', 'conf', 'masks', 'keypoints', 'batch_idx', 'img'.
+        labels (dict[str, Any]): Dictionary containing detection data with keys like 'cls', 'bboxes', 'conf', 'masks',
+            'keypoints', 'batch_idx', 'img'.
         images (torch.Tensor | np.ndarray]): Batch of images to plot. Shape: (batch_size, channels, height, width).
         paths (Optional[list[str]]): List of file paths for each image in the batch.
         fname (str): Output filename for the plotted image grid.
@@ -728,7 +729,7 @@ def plot_images(
             labels[k] = labels[k].cpu().numpy()
 
     cls = labels.get("cls", np.zeros(0, dtype=np.int64))
-    batch_idx = labels.get("batch_idx", np.zeros(cls.shape, dtype=np.int64))
+    batch_idx = labels.get("batch_idx", np.zeros(cls.shape, dtype=np.int64))  # New version uses .flatten()
     bboxes = labels.get("bboxes", np.zeros(0, dtype=np.float32))
     confs = labels.get("conf", None)
     masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
@@ -738,9 +739,11 @@ def plot_images(
     if len(images) and isinstance(images, torch.Tensor):
         images = images.cpu().float().numpy()
 
-    # Handle 2-ch and n-ch images
+    # Handle 1-ch, 2-ch, n-ch images
     c = images.shape[1]
-    if c == 2:
+    if c == 1: # Grayscale
+        images = np.repeat(images, 3, axis=1) # (1, H, W) -> (3, H, W)
+    elif c == 2:
         zero = np.zeros_like(images[:, :1])
         images = np.concatenate((images, zero), axis=1)  # pad 2-ch with a black channel
     elif c > 3:
@@ -772,8 +775,23 @@ def plot_images(
     for i in range(bs):
         x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
         annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
+        
+        # START MERGED CODE
         if paths:
-            annotator.text([x + 5, y + 5], text=Path(paths[i]).name[:40], txt_color=(220, 220, 220))  # filenames
+            # Correctly calculate the path index for standard and multi-window modes
+            if len(paths) > 0 and bs > len(paths):
+                # Handles the multi-window case (e.g., 40 images from 4 paths)
+                images_per_path = bs // len(paths)
+                path_idx = i // images_per_path
+            else:
+                # Handles the standard 1-to-1 case
+                path_idx = i
+
+            # Final safety check before accessing the path
+            if path_idx < len(paths):
+                annotator.text([x + 5, y + 5], text=Path(paths[path_idx]).name[:40], txt_color=(220, 220, 220))
+        # END MERGED CODE
+        
         if len(cls) > 0:
             idx = batch_idx == i
             classes = cls[idx].astype("int")
@@ -788,23 +806,24 @@ def plot_images(
                         boxes[..., [1, 3]] *= h
                     elif scale < 1:  # absolute coords need scale if image scales
                         boxes[..., :4] *= scale
-                boxes[..., 0] += x
-                boxes[..., 1] += y
-                is_obb = boxes.shape[-1] == 5  # xywhr
-                # TODO: this transformation might be unnecessary
-                boxes = ops.xywhr2xyxyxyxy(boxes) if is_obb else ops.xywh2xyxy(boxes)
-                for j, box in enumerate(boxes.astype(np.int64).tolist()):
-                    c = classes[j]
-                    color = colors(c)
-                    c = names.get(c, c) if names else c
-                    if labels or conf[j] > conf_thres:
-                        label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
-                        annotator.box_label(box, label, color=color)
+                    boxes[..., 0] += x
+                    boxes[..., 1] += y
+                    is_obb = boxes.shape[-1] == 5  # xywhr
+                    # TODO: this transformation might be unnecessary
+                    boxes = ops.xywhr2xyxyxyxy(boxes) if is_obb else ops.xywh2xyxy(boxes)
+                    for j, box in enumerate(boxes.astype(np.int64).tolist()):
+                        c = classes[j]
+                        color = colors(c)
+                        c = names.get(c, c) if names else c
+                        if labels or conf[j] > conf_thres:
+                            label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
+                            annotator.box_label(box, label, color=color)
 
             elif len(classes):
                 for c in classes:
                     color = colors(c)
                     c = names.get(c, c) if names else c
+                    # Updated label text from new version
                     label = f"{c}" if labels else f"{c} {conf[0]:.1f}"
                     annotator.text([x, y], label, txt_color=color, box_color=(64, 64, 64, 128))
 
@@ -817,14 +836,15 @@ def plot_images(
                         kpts_[..., 1] *= h
                     elif scale < 1:  # absolute coords need scale if image scales
                         kpts_ *= scale
-                kpts_[..., 0] += x
-                kpts_[..., 1] += y
-                for j in range(len(kpts_)):
-                    if labels or conf[j] > conf_thres:
-                        annotator.kpts(kpts_[j], conf_thres=conf_thres)
+                    kpts_[..., 0] += x
+                    kpts_[..., 1] += y
+                    for j in range(len(kpts_)):
+                        if labels or conf[j] > conf_thres:
+                            annotator.kpts(kpts_[j], conf_thres=conf_thres)
 
             # Plot masks
             if len(masks):
+                # Updated mask indexing logic from new version
                 if idx.shape[0] == masks.shape[0] and masks.max() <= 1:  # overlap_mask=False
                     image_masks = masks[idx]
                 else:  # overlap_mask=True
@@ -871,7 +891,7 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
 
     Examples:
         >>> from ultralytics.utils.plotting import plot_results
-        >>> plot_results("path/to/results.csv", segment=True)
+        >>> plot_results("path/to/results.csv")
     """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
     import polars as pl
@@ -886,6 +906,7 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
         try:
             data = pl.read_csv(f, infer_schema_length=None)
             if i == 0:
+                # Dynamically determine plot layout
                 for c in data.columns:
                     if "loss" in c:
                         loss_keys.append(c)
@@ -895,7 +916,10 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 columns = (
                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
                 )
-                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
+                if not columns: # Handle case with no loss or metric keys
+                     LOGGER.warning(f"No loss or metric columns found in {f}. Skipping plot.")
+                     continue
+                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) * 2 + 4, 6), tight_layout=True)
                 ax = ax.ravel()
             x = data.select(data.columns[0]).to_numpy().flatten()
             for i, j in enumerate(columns):
@@ -905,7 +929,8 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 ax[i].set_title(j, fontsize=12)
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
-    ax[1].legend()
+    if 'ax' in locals() and ax[1].get_legend_handles_labels()[0]: # Check if ax was initialized and has labels
+        ax[1].legend()
     fname = save_dir / "results.png"
     fig.savefig(fname, dpi=200)
     plt.close()
