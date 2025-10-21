@@ -68,11 +68,23 @@ class Bboxes:
             bboxes (np.ndarray): Array of bounding boxes with shape (N, 4) or (4,).
             format (str): Format of the bounding boxes, one of 'xyxy', 'xywh', or 'ltwh'.
         """
-        assert format in _formats, f"Invalid bounding box format: {format}, format must be one of {_formats}"
-        bboxes = bboxes[None, :] if bboxes.ndim == 1 else bboxes
-        assert bboxes.ndim == 2
-        assert bboxes.shape[1] == 4
-        self.bboxes = bboxes
+        assert format in ("xyxy", "xywh", "ltwh", "xywhr"), f"unsupported format {format}"
+        
+        # This is the fix: Ensure the data is and remains a NumPy array.
+        if isinstance(bboxes, torch.Tensor):
+            bboxes = bboxes.numpy()  # Convert tensor to numpy if needed
+        if not isinstance(bboxes, np.ndarray):
+            bboxes = np.array(bboxes, dtype=np.float32)
+
+        if bboxes.ndim == 1:
+            bboxes = np.expand_dims(bboxes, axis=0)
+            
+        min_vals = 5 if format == "xywhr" else 4
+
+        if bboxes.shape[0] > 0:  # Only check shape if there are boxes
+            assert bboxes.shape[1] >= min_vals, f"bboxes shape should be at least (N, {min_vals}), but got {bboxes.shape}"
+
+        self.bboxes = bboxes.astype(np.float32)
         self.format = format
 
     def convert(self, format: str) -> None:
@@ -242,7 +254,20 @@ class Instances:
         self._bboxes = Bboxes(bboxes=bboxes, format=bbox_format)
         self.keypoints = keypoints
         self.normalized = normalized
-        self.segments = segments
+        
+        # This is the definitive fix:
+        # It ensures self.segments is always a NumPy array.
+        if segments is None:
+            self.segments = np.array([])
+        else:
+            # The `dtype=object` is important for handling lists of arrays (ragged arrays)
+            # which is common for segmentation masks.
+            if len(segments) > 0 and not isinstance(segments, np.ndarray):
+                 self.segments = np.array(segments, dtype=object)
+            elif len(segments) == 0:
+                 self.segments = np.array([])
+            else:
+                 self.segments = segments
 
     def convert_bbox(self, format: str) -> None:
         """
@@ -267,11 +292,24 @@ class Instances:
             scale_h (float): Scale factor for height.
             bbox_only (bool, optional): Whether to scale only bounding boxes.
         """
-        self._bboxes.mul(scale=(scale_w, scale_h, scale_w, scale_h))
+        # Save original format and convert to xyxy for safe scaling
+        ori_format = self._bboxes.format
+        self.convert_bbox(format="xyxy")
+
+        # Scale bounding boxes
+        self.bboxes[:, 0::2] *= scale_w
+        self.bboxes[:, 1::2] *= scale_h
+
+        # Convert back to original format
+        self.convert_bbox(format=ori_format)
+
         if bbox_only:
             return
-        self.segments[..., 0] *= scale_w
-        self.segments[..., 1] *= scale_h
+
+        if self.segments is not None and self.segments.size > 0:
+            self.segments[..., 0] *= scale_w
+            self.segments[..., 1] *= scale_h
+
         if self.keypoints is not None:
             self.keypoints[..., 0] *= scale_w
             self.keypoints[..., 1] *= scale_h
@@ -286,12 +324,27 @@ class Instances:
         """
         if not self.normalized:
             return
+
+        # Save original format and convert to xyxy for safe denormalization
+        ori_format = self._bboxes.format
+        self.convert_bbox(format="xyxy")
+
+        # Denormalize bounding boxes
         self._bboxes.mul(scale=(w, h, w, h))
-        self.segments[..., 0] *= w
-        self.segments[..., 1] *= h
+
+        # Convert back to original format
+        if ori_format != "xyxy":
+            self.convert_bbox(format=ori_format)
+
+        # Denormalize segments and keypoints
+        if self.segments is not None and self.segments.size > 0:
+            self.segments[..., 0] *= w
+            self.segments[..., 1] *= h
+
         if self.keypoints is not None:
             self.keypoints[..., 0] *= w
             self.keypoints[..., 1] *= h
+            
         self.normalized = False
 
     def normalize(self, w: int, h: int) -> None:
@@ -304,12 +357,27 @@ class Instances:
         """
         if self.normalized:
             return
+
+        # Save original format and convert to xyxy for safe normalization
+        ori_format = self._bboxes.format
+        self.convert_bbox(format="xyxy")
+
+        # Normalize bounding boxes
         self._bboxes.mul(scale=(1 / w, 1 / h, 1 / w, 1 / h))
-        self.segments[..., 0] /= w
-        self.segments[..., 1] /= h
+
+        # Convert back to original format
+        if ori_format != "xyxy":
+            self.convert_bbox(format=ori_format)
+            
+        # Normalize segments and keypoints
+        if self.segments is not None and self.segments.size > 0:
+            self.segments[..., 0] /= w
+            self.segments[..., 1] /= h
+            
         if self.keypoints is not None:
             self.keypoints[..., 0] /= w
             self.keypoints[..., 1] /= h
+            
         self.normalized = True
 
     def add_padding(self, padw: int, padh: int) -> None:
@@ -321,9 +389,22 @@ class Instances:
             padh (int): Padding height.
         """
         assert not self.normalized, "you should add padding with absolute coordinates."
-        self._bboxes.add(offset=(padw, padh, padw, padh))
-        self.segments[..., 0] += padw
-        self.segments[..., 1] += padh
+
+        # Save original format and convert to xyxy for safe padding
+        ori_format = self._bboxes.format
+        self.convert_bbox(format="xyxy")
+
+        # Add padding to bounding boxes
+        self.bboxes[:, 0::2] += padw
+        self.bboxes[:, 1::2] += padh
+
+        # Convert back to original format
+        self.convert_bbox(format=ori_format)
+
+        if self.segments is not None and self.segments.size > 0:
+            self.segments[..., 0] += padw
+            self.segments[..., 1] += padh
+
         if self.keypoints is not None:
             self.keypoints[..., 0] += padw
             self.keypoints[..., 1] += padh
