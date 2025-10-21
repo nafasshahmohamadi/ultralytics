@@ -1329,42 +1329,86 @@ class RandomPerspective:
         img = labels["img"]
         cls = labels["cls"]
         instances = labels.pop("instances")
-        # Make sure the coord formats are right
-        instances.convert_bbox(format="xyxy")
+        
+        # Denormalize all coordinates to absolute pixel values
         instances.denormalize(*img.shape[:2][::-1])
+
+        # Save the original format and convert to xyxy for the transformation
+        ori_format = instances._bboxes.format
+        instances.convert_bbox(format="xyxy")
 
         border = labels.pop("mosaic_border", self.border)
         self.size = img.shape[1] + border[1] * 2, img.shape[0] + border[0] * 2  # w, h
-        # M is affine matrix
-        # Scale for func:`box_candidates`
         img, M, scale = self.affine_transform(img, border)
 
-        bboxes = self.apply_bboxes(instances.bboxes, M)
-
+        bboxes = instances.bboxes
         segments = instances.segments
         keypoints = instances.keypoints
-        # Update bboxes if there are segments.
+
+        is_obb = bboxes.shape[1] == 8 if bboxes.ndim == 2 and bboxes.size > 0 else False
+
+        # Transform geometric components (now safely operating on xyxy data)
+        if is_obb:
+            transformed_bboxes = self.apply_segments(bboxes.reshape(-1, 4, 2), M)[1].reshape(-1, 8)
+        else:
+            transformed_bboxes = self.apply_bboxes(bboxes, M)
+
+        # Generate filter index `i`
+        box1_for_filter = xyxyxyxy2xyxy(bboxes) if is_obb else bboxes
+        box2_for_filter = xyxyxyxy2xywhr(transformed_bboxes).reshape(-1, 5)[:,:4] if is_obb else transformed_bboxes # TODO: xywhr is not xyxy
+        box2_for_filter = xywh2xyxy(box2_for_filter) if is_obb else box2_for_filter
+        
+        i = self.box_candidates(
+            box1=box1_for_filter.T, box2=box2_for_filter.T, area_thr=0.01 if len(segments) else 0.10
+        )
+
+        # Filter all components
+        final_cls = cls[i]
+        final_bboxes = transformed_bboxes[i]
+
         if len(segments):
-            bboxes, segments = self.apply_segments(segments, M)
+            if len(segments) == len(bboxes):
+                bboxes_from_segments, transformed_segments = self.apply_segments(segments, M)
+                final_segments = transformed_segments[i]
+                if not is_obb:
+                    final_bboxes = bboxes_from_segments[i]
+            else:
+                LOGGER.warning(f"Number of bboxes ({len(bboxes)}) and segments ({len(segments)}) mismatch. Segments will be discarded.")
+                final_segments = np.array([])
+        else:
+            final_segments = np.array([])
 
         if keypoints is not None:
-            keypoints = self.apply_keypoints(keypoints, M)
-        new_instances = Instances(bboxes, segments, keypoints, bbox_format="xyxy", normalized=False)
-        # Clip
+            if len(keypoints) == len(bboxes):
+                transformed_keypoints = self.apply_keypoints(keypoints, M)
+                final_keypoints = transformed_keypoints[i]
+            else:
+                LOGGER.warning(f"Number of bboxes ({len(bboxes)}) and keypoints ({len(keypoints)}) mismatch. Keypoints will be discarded.")
+                final_keypoints = None
+        else:
+            final_keypoints = None
+
+        # Create final Instances object. It's currently in xyxy format.
+        new_instances = Instances(final_bboxes, final_segments, final_keypoints, bbox_format="xyxy", normalized=False)
         new_instances.clip(*self.size)
 
-        # Filter instances
-        instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
-        # Make the bboxes have the same scale with new_bboxes
-        i = self.box_candidates(
-            box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else 0.10
-        )
-        labels["instances"] = new_instances[i]
-        labels["cls"] = cls[i]
+        # --- THIS IS THE CRITICAL FIX ---
+        # Remove any boxes that have become zero-area after clipping
+        good = new_instances.remove_zero_area_boxes()
+        final_cls = final_cls[good]
+        # --- END OF FIX ---
+
+        # Convert the bboxes back to their original format
+        if ori_format != "xyxy":
+            new_instances.convert_bbox(format=ori_format)
+
+        labels["instances"] = new_instances
+        labels["cls"] = final_cls
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
-        return labels
 
+        return labels
+        
     @staticmethod
     def box_candidates(
         box1: np.ndarray,
@@ -1873,6 +1917,96 @@ class CopyPaste(BaseMixTransform):
         return labels1
 
 
+class RandomWindowing(BaseTransform):
+    """
+    Applies either a standard (40, 80) windowing or a random Gaussian-shifted windowing.
+    """
+    def __init__(self, p: float = 1.0, p_standard: float = 0.1, window_center: int = 40, window_width: int = 80, std_shift: float = 5.0):
+        """
+        Initializes the transform.
+
+        Args:
+            p (float): Probability of applying any windowing.
+            p_standard (float): Probability of applying the standard (40, 80) window, if windowing is applied.
+                                The rest of the time (1 - p_standard), random windowing is used.
+            window_center (int): Base window center.
+            window_width (int): Base window width.
+            std_shift (float): Standard deviation for the random shift.
+        """
+        super().__init__()
+        self.p = p
+        self.p_standard = p_standard
+        self.window_center = window_center
+        self.window_width = window_width
+        self.std_shift = std_shift
+
+    def apply_image(self, labels: Dict[str, Any]):
+        if random.random() > self.p:
+            return
+
+        img = labels["img"]
+        original_dtype = img.dtype
+        # Only apply to non-uint8 (i.e., raw .npy) data
+        if original_dtype != np.uint8:
+            img_float = img.astype(np.float32)
+
+            # Decide whether to apply standard or random windowing
+            if random.random() < self.p_standard:
+                # Apply the STANDARD, fixed windowing
+                shift = 0.0
+            else:
+                # Apply RANDOM windowing
+                shift = np.random.normal(loc=0.0, scale=self.std_shift)
+
+            # The rest of the logic is the same
+            lower_bound = self.window_center - (self.window_width / 2) + shift
+            upper_bound = self.window_center + (self.window_width / 2) + shift
+
+            img_float = np.clip(img_float, lower_bound, upper_bound)
+
+            if upper_bound > lower_bound:
+                img_float = 255.0 * (img_float - lower_bound) / (upper_bound - lower_bound)
+            else:
+                img_float.fill(0)
+
+            labels["img"] = np.clip(img_float, 0, 255).astype(np.uint8) # Convert to uint8 for subsequent transforms
+        
+    def __call__(self, labels: Dict[str, Any]) -> Dict[str, Any]:
+        super().__call__(labels)
+        return labels
+
+
+class DefaultWindowing(BaseTransform):
+    """Applies a standard (40, 80) windowing to CT scans to convert them to a viewable format."""
+    def __init__(self, window_center: int = 40, window_width: int = 80):
+        super().__init__()
+        self.window_center = window_center
+        self.window_width = window_width
+
+    def apply_image(self, labels: Dict[str, Any]):
+        img = labels["img"]
+        # Only apply to raw float data, not uint8 images
+        if img.dtype != np.uint8:
+            lower_bound = self.window_center - (self.window_width / 2)
+            upper_bound = self.window_center + (self.window_width / 2)
+            
+            img_float = img.astype(np.float32)
+            np.clip(img_float, lower_bound, upper_bound, out=img_float)
+            
+            # Normalize to 0-255
+            if upper_bound > lower_bound:
+                img_float = 255.0 * (img_float - lower_bound) / (upper_bound - lower_bound)
+            else:
+                img_float.fill(0)
+
+            # Convert to standard image format
+            labels["img"] = img_float.astype(np.uint8)
+
+    def __call__(self, labels: Dict[str, Any]) -> Dict[str, Any]:
+        self.apply_image(labels)
+        return labels
+
+
 class Albumentations:
     """
     Albumentations transformations for image augmentation.
@@ -2111,6 +2245,7 @@ class Format:
         mask_overlap: bool = True,
         batch_idx: bool = True,
         bgr: float = 0.0,
+        use_obb: bool = False,
     ):
         """
         Initialize the Format class with given parameters for image and instance annotation formatting.
@@ -2154,6 +2289,7 @@ class Format:
         self.mask_overlap = mask_overlap
         self.batch_idx = batch_idx  # keep the batch indexes
         self.bgr = bgr
+        self.use_obb = use_obb
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """
@@ -2185,11 +2321,28 @@ class Format:
             >>> print(formatted_labels.keys())
         """
         img = labels.pop("img")
-        h, w = img.shape[:2]
+
+        # Handle both single and stacked images
+        is_multi_window = img.ndim == 4
+        if is_multi_window:
+            labels["img"] = torch.stack([self._format_img(im) for im in img], dim=0)
+            h, w = img.shape[1], img.shape[2]
+        else:
+            h, w = img.shape[:2]
+            labels["img"] = self._format_img(img)
+
         cls = labels.pop("cls")
         instances = labels.pop("instances")
-        instances.convert_bbox(format=self.bbox_format)
-        instances.denormalize(w, h)
+        # FIX: Convert bbox format for AABB tasks before further processing
+        if not self.use_obb:
+            instances.convert_bbox(format=self.bbox_format)
+
+        # If using OBB, get the 8-point data from segments and reshape it
+        if self.use_obb:
+            bboxes = instances.segments.reshape(-1, 8) if len(instances.segments) > 0 else np.zeros((0, 8), dtype=np.float32)
+        else:
+            bboxes = instances.bboxes
+        
         nl = len(instances)
 
         if self.return_mask:
@@ -2198,12 +2351,20 @@ class Format:
                 masks = torch.from_numpy(masks)
             else:
                 masks = torch.zeros(
-                    1 if self.mask_overlap else nl, img.shape[0] // self.mask_ratio, img.shape[1] // self.mask_ratio
+                    1 if self.mask_overlap else nl, labels["img"].shape[-2] // self.mask_ratio, labels["img"].shape[-1] // self.mask_ratio
                 )
             labels["masks"] = masks
-        labels["img"] = self._format_img(img)
-        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl, 1)
-        labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+
+        labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
+        
+        # FINAL FIX 1: Unify OBB format for both training and validation
+        if self.use_obb:
+            # For ANY OBB task, convert 8-point polygons to 5-point xywhr for the loss function
+            labels["bboxes"] = torch.from_numpy(xyxyxyxy2xywhr(bboxes)) if nl else torch.zeros((0, 5))
+        else:
+            # Standard case (AABB)
+            labels["bboxes"] = torch.from_numpy(bboxes) if nl else torch.zeros((0, 4))
+
         if self.return_keypoint:
             labels["keypoints"] = (
                 torch.empty(0, 3) if instances.keypoints is None else torch.from_numpy(instances.keypoints)
@@ -2211,19 +2372,21 @@ class Format:
             if self.normalize:
                 labels["keypoints"][..., 0] /= w
                 labels["keypoints"][..., 1] /= h
-        if self.return_obb:
-            labels["bboxes"] = (
-                xyxyxyxy2xywhr(torch.from_numpy(instances.segments)) if len(instances.segments) else torch.zeros((0, 5))
-            )
-        # NOTE: need to normalize obb in xywhr format for width-height consistency
-        if self.normalize:
-            labels["bboxes"][:, [0, 2]] /= w
-            labels["bboxes"][:, [1, 3]] /= h
-        # Then we can use collate_fn
+
+        if self.normalize and nl > 0:
+            # FINAL FIX 2: Correctly normalize the appropriate format
+            if self.use_obb:
+                # For OBB (xywhr), only normalize the first 4 values
+                labels["bboxes"][:, :4] /= torch.tensor([w, h, w, h], device=labels["bboxes"].device)
+            else:
+                # For standard 4-point boxes
+                labels["bboxes"] /= torch.tensor([w, h, w, h], device=labels["bboxes"].device)
+
         if self.batch_idx:
             labels["batch_idx"] = torch.zeros(nl)
-        return labels
 
+        return labels
+        
     def _format_img(self, img: np.ndarray) -> torch.Tensor:
         """
         Format an image for YOLO from a Numpy array to a PyTorch tensor.
@@ -2251,7 +2414,7 @@ class Format:
         if len(img.shape) < 3:
             img = np.expand_dims(img, -1)
         img = img.transpose(2, 0, 1)
-        img = np.ascontiguousarray(img[::-1] if random.uniform(0, 1) > self.bgr and img.shape[0] == 3 else img)
+        img = np.ascontiguousarray(img[::-1] if random.uniform(0, 1) < self.bgr and img.shape[0] == 3 else img)
         img = torch.from_numpy(img)
         return img
 
@@ -2584,6 +2747,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
 
     return Compose(
         [
+            RandomWindowing(p=getattr(hyp, 'random_windowing', 1.0)),  # Apply windowing FIRST
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
@@ -2593,6 +2757,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]
     )  # transforms
+    
 
 
 # Classification augmentations -----------------------------------------------------------------------------------------
