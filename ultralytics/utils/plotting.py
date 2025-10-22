@@ -781,17 +781,17 @@ def plot_images(
         annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
         if paths:
             # Correctly calculate the path index for standard and multi-window modes
-        if len(paths) > 0 and bs > len(paths):
-            # Handles the multi-window case (e.g., 40 images from 4 paths)
-            images_per_path = bs // len(paths)
-            path_idx = i // images_per_path
-        else:
-            # Handles the standard 1-to-1 case
-            path_idx = i
+            if len(paths) > 0 and bs > len(paths):
+                # Handles the multi-window case (e.g., 40 images from 4 paths)
+                images_per_path = bs // len(paths)
+                path_idx = i // images_per_path
+            else:
+                # Handles the standard 1-to-1 case
+                path_idx = i
 
-        # Final safety check before accessing the path
-        if path_idx < len(paths):
-            annotator.text([x + 5, y + 5], text=Path(paths[path_idx]).name[:40], txt_color=(220, 220, 220))
+            # Final safety check before accessing the path
+            if path_idx < len(paths):
+                annotator.text([x + 5, y + 5], text=Path(paths[path_idx]).name[:40], txt_color=(220, 220, 220))
         
         if len(cls) > 0:
             idx = batch_idx == i
