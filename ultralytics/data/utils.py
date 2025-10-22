@@ -336,14 +336,20 @@ def verify_image_label(args: tuple) -> list:
     except Exception as e:
         nc = 1
         msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
-        # <-- START ERROR RETURN ADJUSTMENT -->
-        # Provide consistent empty/default return structure on error
-        error_shape = None
-        error_lb = np.zeros((0, 5), dtype=np.float32) # Standard Nx5 AABB format
+        # <-- START NEW ROBUST ERROR RETURN -->
+        # Return a consistent structure with empty/None values
+        error_shape = None 
+        error_lb = np.zeros((0, 5), dtype=np.float32)  # Return empty Nx5 AABB
         error_segments = []
-        error_keypoints = None if not keypoint else np.zeros((0, nkpt, ndim + (1 if ndim == 2 else 0)), dtype=np.float32) # Match expected keypoint structure
+        error_keypoints = None
+                
+        # Check args to see if we should return empty keypoints
+        if args[3]:  # args[3] is 'keypoint'
+        nkpt, ndim = args[5], args[6]
+        error_keypoints = np.zeros((0, nkpt, ndim + (1 if ndim == 2 else 0)), dtype=np.float32)
+
         return [im_file, error_lb, error_shape, error_segments, error_keypoints, nm, nf, ne, nc, msg]
-        # <-- END ERROR RETURN ADJUSTMENT -->
+        # <-- END NEW ROBUST ERROR RETURN -->
 
 def visualize_image_annotations(image_path: str, txt_path: str, label_map: dict[int, str]):
     """
