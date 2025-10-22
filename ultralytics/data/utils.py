@@ -345,8 +345,8 @@ def verify_image_label(args: tuple) -> list:
                 
         # Check args to see if we should return empty keypoints
         if args[3]:  # args[3] is 'keypoint'
-        nkpt, ndim = args[5], args[6]
-        error_keypoints = np.zeros((0, nkpt, ndim + (1 if ndim == 2 else 0)), dtype=np.float32)
+            nkpt, ndim = args[5], args[6]
+            error_keypoints = np.zeros((0, nkpt, ndim + (1 if ndim == 2 else 0)), dtype=np.float32)
 
         return [im_file, error_lb, error_shape, error_segments, error_keypoints, nm, nf, ne, nc, msg]
         # <-- END NEW ROBUST ERROR RETURN -->
