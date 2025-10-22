@@ -353,10 +353,21 @@ class BaseDataset(Dataset):
 
     def set_rectangle(self) -> None:
         """Set the shape of bounding boxes for YOLO detections as rectangles."""
-        bi = np.floor(np.arange(self.ni) / self.batch_size).astype(int)  # batch index
-        nb = bi[-1] + 1  # number of batches
+        # <-- START MODIFICATION -->
+        # Filter out labels with None shape (result of bad data found by verify_image_label)
+        original_len = len(self.labels)
+        self.labels = [x for x in self.labels if x["shape"] is not None]
+        if len(self.labels) < original_len:
+            LOGGER.warning(f"WARNING ⚠️ {original_len - len(self.labels)} images failed to load and were skipped.")
+        
+        if not self.labels:
+            LOGGER.error("ERROR ❌ No valid labels found for rectangle training.")
+            return
 
-        s = np.array([x.pop("shape") for x in self.labels])  # hw
+        bi = np.floor(np.arange(len(self.labels)) / self.batch_size).astype(int)  # batch index
+        nb = bi[-1] + 1  # number of batches
+        s = np.array([x.pop("shape") for x in self.labels])  # hw (now safe from None)
+        # <-- END MODIFICATION -->
         ar = s[:, 0] / s[:, 1]  # aspect ratio
         irect = ar.argsort()
         self.im_files = [self.im_files[i] for i in irect]
