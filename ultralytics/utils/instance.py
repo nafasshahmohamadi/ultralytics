@@ -486,8 +486,20 @@ class Instances:
         self.bboxes[:, [1, 3]] = self.bboxes[:, [1, 3]].clip(0, h)
         if ori_format != "xyxy":
             self.convert_bbox(format=ori_format)
-        self.segments[..., 0] = self.segments[..., 0].clip(0, w)
-        self.segments[..., 1] = self.segments[..., 1].clip(0, h)
+
+        # <-- START MODIFICATION -->
+        # Add NumPy-safe check for the existence of segments.
+        if self.segments is not None and self.segments.size > 0:
+            # Check if it's an object array (list of segments) or a 3D array
+            if self.segments.dtype == object:
+                for i in range(len(self.segments)):
+                    self.segments[i][..., 0] = self.segments[i][..., 0].clip(0, w)
+                    self.segments[i][..., 1] = self.segments[i][..., 1].clip(0, h)
+            else:  # Assumes 3D array (N, M, 2) or (N, 8) for OBB
+                self.segments[..., 0] = self.segments[..., 0].clip(0, w)
+                self.segments[..., 1] = self.segments[..., 1].clip(0, h)
+        # <-- END MODIFICATION -->
+
         if self.keypoints is not None:
             # Set out of bounds visibility to zero
             self.keypoints[..., 2][
@@ -498,7 +510,7 @@ class Instances:
             ] = 0.0
             self.keypoints[..., 0] = self.keypoints[..., 0].clip(0, w)
             self.keypoints[..., 1] = self.keypoints[..., 1].clip(0, h)
-
+                
     def remove_zero_area_boxes(self) -> np.ndarray:
         """
         Remove zero-area boxes, i.e. after clipping some boxes may have zero width or height.
