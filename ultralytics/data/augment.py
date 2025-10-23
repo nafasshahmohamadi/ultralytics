@@ -1969,7 +1969,10 @@ class RandomWindowing(BaseTransform):
             else:
                 img_float.fill(0)
 
-            labels["img"] = np.clip(img_float, 0, 255).astype(np.uint8) # Convert to uint8 for subsequent transforms
+            img_processed = np.clip(img_float, 0, 255).astype(np.uint8) # Convert to uint8
+            if img_processed.ndim == 2:  # Check if it's 1-channel
+                img_processed = cv2.cvtColor(img_processed, cv2.COLOR_GRAY2BGR)
+            labels["img"] = img_processed
         
     def __call__(self, labels: Dict[str, Any]) -> Dict[str, Any]:
         super().__call__(labels)
@@ -2000,7 +2003,11 @@ class DefaultWindowing(BaseTransform):
                 img_float.fill(0)
 
             # Convert to standard image format
-            labels["img"] = img_float.astype(np.uint8)
+            img_processed = img_float.astype(np.uint8)
+
+            if img_processed.ndim == 2:  # Check if it's 1-channel
+                img_processed = cv2.cvtColor(img_processed, cv2.COLOR_GRAY2BGR)
+            labels["img"] = img_processed
 
     def __call__(self, labels: Dict[str, Any]) -> Dict[str, Any]:
         self.apply_image(labels)
