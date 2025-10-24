@@ -253,12 +253,13 @@ def verify_image_label(args: tuple) -> list:
 
                 # <-- END INSERTED OBB/POLY HANDLING -->
 
-            if nl := len(lb):
+            
                 # <-- START MODIFIED ASSERTIONS and Coordinate Checks -->
-                expected_cols = 5
-                if keypoint:
-                     expected_cols = 5 + nkpt * ndim
+            expected_cols = 5
+            if keypoint:
+                expected_cols = 5 + nkpt * ndim
 
+            if nl := len(lb):
                 # Assert based on the *potentially converted* AABB format (Nx5) for checks
                 # OBB/Polygons were converted to Nx5 'lb' above for these checks
                 assert lb.shape[1] == expected_cols, (
