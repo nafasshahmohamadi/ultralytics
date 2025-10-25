@@ -1941,38 +1941,35 @@ class RandomWindowing(BaseTransform):
         self.std_shift = std_shift
 
     def apply_image(self, labels: Dict[str, Any]):
-        if random.random() > self.p:
-            return
-
         img = labels["img"]
         original_dtype = img.dtype
-        # Only apply to non-uint8 (i.e., raw .npy) data
-        if original_dtype != np.uint8:
+        
+        if random.random() <= self.p and original_dtype != np.uint8:
+            # Apply windowing logic
             img_float = img.astype(np.float32)
-
-            # Decide whether to apply standard or random windowing
             if random.random() < self.p_standard:
-                # Apply the STANDARD, fixed windowing
-                shift = 0.0
+                shift = 0.0  # Apply the STANDARD, fixed windowing
             else:
-                # Apply RANDOM windowing
-                shift = np.random.normal(loc=0.0, scale=self.std_shift)
-
-            # The rest of the logic is the same
+                shift = np.random.normal(loc=0.0, scale=self.std_shift)  # Apply RANDOM windowing
+            
             lower_bound = self.window_center - (self.window_width / 2) + shift
             upper_bound = self.window_center + (self.window_width / 2) + shift
 
             img_float = np.clip(img_float, lower_bound, upper_bound)
-
             if upper_bound > lower_bound:
                 img_float = 255.0 * (img_float - lower_bound) / (upper_bound - lower_bound)
             else:
                 img_float.fill(0)
-
-            img_processed = np.clip(img_float, 0, 255).astype(np.uint8) # Convert to uint8
-            if img_processed.ndim == 2:  # Check if it's 1-channel
-                img_processed = cv2.cvtColor(img_processed, cv2.COLOR_GRAY2BGR)
-            labels["img"] = img_processed
+            
+            img = np.clip(img_float, 0, 255).astype(np.uint8)  # Convert to uint8
+        
+        # ALWAYS ensure 3-channel output
+        if img.ndim == 2:  # (H, W)
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 1:  # (H, W, 1)
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        
+        labels["img"] = img
         
     def __call__(self, labels: Dict[str, Any]) -> Dict[str, Any]:
         super().__call__(labels)
@@ -1988,8 +1985,10 @@ class DefaultWindowing(BaseTransform):
 
     def apply_image(self, labels: Dict[str, Any]):
         img = labels["img"]
+        original_dtype = img.dtype
+
         # Only apply to raw float data, not uint8 images
-        if img.dtype != np.uint8:
+        if original_dtype != np.uint8:
             lower_bound = self.window_center - (self.window_width / 2)
             upper_bound = self.window_center + (self.window_width / 2)
             
@@ -2003,11 +2002,15 @@ class DefaultWindowing(BaseTransform):
                 img_float.fill(0)
 
             # Convert to standard image format
-            img_processed = img_float.astype(np.uint8)
+            img = img_float.astype(np.uint8)
+        
+        # ALWAYS ensure 3-channel output
+        if img.ndim == 2:  # (H, W)
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 1:  # (H, W, 1)
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-            if img_processed.ndim == 2:  # Check if it's 1-channel
-                img_processed = cv2.cvtColor(img_processed, cv2.COLOR_GRAY2BGR)
-            labels["img"] = img_processed
+        labels["img"] = img
 
     def __call__(self, labels: Dict[str, Any]) -> Dict[str, Any]:
         self.apply_image(labels)
