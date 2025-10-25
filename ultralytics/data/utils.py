@@ -184,6 +184,12 @@ def verify_image_label(args: tuple) -> list:
     # Number (missing, found, empty, corrupt), message, segments, keypoints
     nm, nf, ne, nc, msg, segments, keypoints = 0, 0, 0, 0, "", [], None
     try:
+        # <-- START FIX 1: Define expected_cols at the top -->
+        expected_cols = 5
+        if keypoint:
+            expected_cols = 5 + nkpt * ndim
+        # <-- END FIX 1 -->
+
         # <-- START INSERTED NPY HANDLING -->
         # Check if the file is a .npy file
         is_npy = Path(im_file).suffix.lower() == ".npy"
@@ -242,24 +248,21 @@ def verify_image_label(args: tuple) -> list:
                         lb = np.array(lb, dtype=np.float32) # Fallback or specific handling
                         segments = [] # Ensure segments is empty if not OBB/Poly
                 else: # Standard AABB or Keypoints
-                     lb = np.array(lb, dtype=np.float32)
-                     # Extract segments only if it's explicitly a segmentation task label (already handled by older ultralytics versions implicitly if len > 6)
-                     if any(len(x) > 6 for x in lb) and not keypoint:
-                         classes = np.array([x[0] for x in lb], dtype=np.float32)
-                         segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]
-                         lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)
-                     else:
-                         segments = [] # Ensure segments is empty for standard AABB/Keypoints
+                    lb = np.array(lb, dtype=np.float32)
+                    # Extract segments only if it's explicitly a segmentation task label (already handled by older ultralytics versions implicitly if len > 6)
+                    if any(len(x) > 6 for x in lb) and not keypoint:
+                        classes = np.array([x[0] for x in lb], dtype=np.float32)
+                        segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]
+                        lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)
+                    else:
+                        segments = [] # Ensure segments is empty for standard AABB/Keypoints
 
                 # <-- END INSERTED OBB/POLY HANDLING -->
 
-            
-                # <-- START MODIFIED ASSERTIONS and Coordinate Checks -->
-            expected_cols = 5
-            if keypoint:
-                expected_cols = 5 + nkpt * ndim
-
             if nl := len(lb):
+                # <-- START MODIFIED ASSERTIONS and Coordinate Checks -->
+                # expected_cols is now defined above
+                
                 # Assert based on the *potentially converted* AABB format (Nx5) for checks
                 # OBB/Polygons were converted to Nx5 'lb' above for these checks
                 assert lb.shape[1] == expected_cols, (
@@ -270,11 +273,11 @@ def verify_image_label(args: tuple) -> list:
                 # Coordinate points check (use AABB part of lb)
                 points_to_check = lb[:, 1:5] # AABB coordinates (cx, cy, w, h)
                 if keypoint:
-                     # Also check keypoint coordinates if they exist
-                     kpt_points = lb[:, 5:].reshape(-1, ndim)[:, :2]
-                     # Check only non-negative keypoints (negative coords indicate invisible points)
-                     valid_kpt_points = kpt_points[np.all(kpt_points >= 0, axis=1)]
-                     if valid_kpt_points.size > 0:
+                    # Also check keypoint coordinates if they exist
+                    kpt_points = lb[:, 5:].reshape(-1, ndim)[:, :2]
+                    # Check only non-negative keypoints (negative coords indicate invisible points)
+                    valid_kpt_points = kpt_points[np.all(kpt_points >= 0, axis=1)]
+                    if valid_kpt_points.size > 0:
                         points_to_check = np.concatenate((points_to_check, valid_kpt_points), axis=0)
 
                 # Assertions remain similar, but ensure they work with the potentially converted 'lb'
@@ -309,7 +312,7 @@ def verify_image_label(args: tuple) -> list:
         else:
             nm = 1  # label missing
             # <-- START MODIFIED MISSING LABEL HANDLING -->
-            expected_cols = 5 + nkpt * ndim if keypoint else 5
+            # expected_cols is now defined above
             lb = np.zeros((0, expected_cols), dtype=np.float32)
             segments = [] # Ensure segments is empty list
             # <-- END MODIFIED MISSING LABEL HANDLING -->
@@ -327,9 +330,9 @@ def verify_image_label(args: tuple) -> list:
 
         # Ensure segments is a list of arrays, even if empty
         if not isinstance(segments, list):
-             segments = [] # Should be handled above, but as safety check
+            segments = [] # Should be handled above, but as safety check
         elif isinstance(segments, np.ndarray) and segments.dtype == object:
-             segments = list(segments) # Convert object array back to list
+            segments = list(segments) # Convert object array back to list
 
         return im_file, final_lb, shape, segments, keypoints, nm, nf, ne, nc, msg
         # <-- END FINAL RETURN ADJUSTMENT -->
@@ -337,7 +340,6 @@ def verify_image_label(args: tuple) -> list:
     except Exception as e:
         nc = 1
         msg = f"{prefix}{im_file}: ignoring corrupt image/label: {e}"
-        
         # <-- START NEW ROBUST ERROR RETURN -->
         # This block is now self-contained and does not depend on variables from the 'try' block.
         error_shape = None
