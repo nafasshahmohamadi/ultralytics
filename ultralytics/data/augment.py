@@ -2349,7 +2349,12 @@ class Format:
 
         # If using OBB, get the 8-point data from segments and reshape it
         if self.use_obb:
-            bboxes = instances.segments.reshape(-1, 8) if len(instances.segments) > 0 else np.zeros((0, 8), dtype=np.float32)
+            if len(instances.segments) > 0:
+                # stack expects a list of (4, 2) arrays, which is what segments is.
+                # This stacks them into (N, 4, 2) and then reshapes to (N, 8)
+                bboxes = np.stack(instances.segments, axis=0).reshape(nl, 8)
+            else:
+                bboxes = np.zeros((0, 8), dtype=np.float32)
         else:
             bboxes = instances.bboxes
         
